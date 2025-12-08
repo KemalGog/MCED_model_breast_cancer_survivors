@@ -2,7 +2,7 @@
 
 This repository contains code supporting the analysis described in:
 
-"Is Multi-Cancer Early Detection Likely to be More Beneficial in a Survivor Population? A Modeling Study in Breast Cancer Survivors" (Gogebakan et al.)****
+"Is Multi-Cancer Early Detection Likely to be More Beneficial in a Survivor Population? A Modeling Study in Breast Cancer Survivors" (Gogebakan et al.)
 
 ## How to Run the Model
 
