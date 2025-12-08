@@ -1,0 +1,228 @@
+## ---- Libraries ----
+library(prodlim)
+library(tidyverse)
+library(readxl)
+library(gtsummary)
+library(survival)
+library(survminer)
+library(flextable)
+library(dplyr)
+library(flexsurv)
+# library(MASS); library(DAAG)   # not used currently
+library(knitr)
+
+## ---- Plot helpers ----
+gg_theme <- function(...){
+  theme_set(theme_classic())
+  theme_update(axis.text=element_text(size=8),
+               axis.title=element_text(size=10),
+               axis.line=element_line(colour='black'),
+               axis.ticks.length=unit(0.2, 'cm'),
+               panel.grid.major=element_blank(),
+               panel.spacing=unit(0.01, 'npc'),
+               panel.border=element_blank(),
+               panel.background=element_blank(),
+               strip.background=element_rect(colour=NA, fill=NA),
+               strip.text=element_text(size=12),
+               plot.title=element_text(hjust=0.5),
+               legend.background=element_blank(),
+               legend.box.background=element_blank())
+  theme_update(...)
+}
+
+gg_save <- function(g, filename, width, height) {
+  png(filename = filename, width = width, height = height, res = 96)
+  print(g)
+  dev.off()
+}
+
+## ---- Data ----
+load('~/OneDrive - Fred Hutchinson Cancer Center/Luteitium Cost Effectiveness/Data/patient-data-processed.RData')
+
+patient_data <-  patient_data |> mutate(
+  Time.since.diagnosis = time_diag_pca,
+  Previous.Chemotherapy = as.integer(prior_chemo == 'Yes'),
+  Hemoglobin = hemoglobin,
+  Tumor.SUVmean = tumor_suvmean,
+  Lesions_20 = as.integer(n_mets == '>20'),
+  Bone.metastases = as.integer(bone_involvement == 'Yes'),
+  Liver.metastases = as.integer(liver_involvement == 'Yes'),
+  Pelvic.Lymph.Nodes = as.integer(pelvic_nodal_involvement == 'Yes'),
+  OS = death_time,
+  Event_OS = death_event,
+  PSA.PFS = progression_time,
+  Event_PFS = progression_event
+)
+
+median_follow_up <- quantile(prodlim(Hist(time=death_time,event=death_event)~1,data=patient_data,reverse=TRUE))
+median_os        <- quantile(prodlim(Hist(time=death_time,event=death_event)~1,data=patient_data,reverse=FALSE))
+median_pfs       <- quantile(prodlim(Hist(time=progression_time,event=progression_event)~1,data=patient_data,reverse=FALSE))
+
+## ---- Survival functions (your helpers) ----
+source("~/OneDrive - Fred Hutchinson Cancer Center/Luteitium Cost Effectiveness/Model/SurvFunctions_final.R")
+
+## ---- Global Model Settings ----
+n.t   <- 60     # horizon in months
+c.l   <- 1      # cycle length (months)
+times <- seq(0, n.t, by = c.l)
+d.r   <- 0.03/12
+
+v.dwc <- 1 / (1 + d.r) ^ (times) # discount weights for costs
+v.dwe <- 1 / (1 + d.r) ^ (times) # discount weights for QALYs
+
+## ---- Kaplan-Meier (PFS / OS) ----
+KM.pfs <- survfit(Surv(time = progression_time, event = progression_event) ~ 1, data = patient_data)
+g <- ggsurvplot(KM.pfs, legend = 'none', censor = FALSE, risk.table = TRUE, palette = 'black')
+g$plot <- g$plot + labs(x = 'Time (months)', y = 'Progression Free Survival')
+gg_save(g, '~/OneDrive - Fred Hutchinson Cancer Center/Luteitium Cost Effectiveness/Data/KM_PFS.png', width = 500, height = 500)
+
+KM.os  <- survfit(Surv(time = death_time,  event = death_event)  ~ 1, data = patient_data)
+g <- ggsurvplot(KM.os, legend = 'none', censor = FALSE, risk.table = TRUE, palette = 'black')
+g$plot <- g$plot + labs(x = 'Time (months)', y = 'Overall Survival')
+gg_save(g, '~/OneDrive - Fred Hutchinson Cancer Center/Luteitium Cost Effectiveness/Data/KM_OS.png', width = 500, height = 500)  # <- fixed filename
+
+## ---- Parametric fits for Lu-PSMA (choose Weibull best) ----
+fit.pfs.lut <- fit.fun(time = "progression_time", event = "progression_event", data = patient_data)
+fit.os.lut  <- fit.fun(time = "death_time",       event = "death_event",      data = patient_data)
+
+best.pfs.lut <- fit.pfs.lut$Weibull
+best.os.lut  <- fit.os.lut$Weibull
+
+shape_pfs_lut <- exp(unname(best.pfs.lut$coefficients["shape"]))
+scale_pfs_lut <- exp(unname(best.pfs.lut$coefficients["scale"]))
+
+shape_os_lut  <- exp(unname(best.os.lut$coefficients["shape"]))
+scale_os_lut  <- exp(unname(best.os.lut$coefficients["scale"]))
+
+## ---- Cabazitaxel via PH scaling (fixed HRs) ----
+HR_OS  <- 1.00
+HR_PFS <- 0.60
+
+shape_pfs_cab <- shape_pfs_lut
+scale_pfs_cab <- scale_pfs_lut * HR_PFS^(1/shape_pfs_lut)
+
+shape_os_cab  <- shape_os_lut
+scale_os_cab  <- scale_os_lut  * HR_OS^(1/shape_os_lut)
+
+## ---- Build S(t) data.frames for both arms (standardize partsurv inputs) ----
+S_pfs_lu <- exp(- (times / scale_pfs_lut) ^ shape_pfs_lut)
+S_os_lu  <- exp(- (times / scale_os_lut)  ^ shape_os_lut)
+best.pfs.lu <- data.frame(time = times, est = S_pfs_lu)
+best.os.lu  <- data.frame(time = times, est = S_os_lu)
+
+S_pfs_cab <- exp(- (times / scale_pfs_cab) ^ shape_pfs_cab)
+S_os_cab  <- exp(- (times / scale_os_cab)  ^ shape_os_cab)
+best.pfs.cab <- data.frame(time = times, est = S_pfs_cab)
+best.os.cab  <- data.frame(time = times, est = S_os_cab)
+
+## ---- Partitioned survival traces ----
+surv_Lu  <- partsurv(best.pfs.lu,  best.os.lu,  title = "Lu-PSMA",   time = times, patient_level_data = FALSE)
+surv_Cab <- partsurv(best.pfs.cab, best.os.cab, title = "Cabazitaxel", time = times, patient_level_data = FALSE)
+
+M.tr.Lu.U  <- as.matrix(surv_Lu$trace)     # occupancy (Stable / Prog / Dead)
+M.tr.Cab.U <- as.matrix(surv_Cab$trace)
+
+# Ensure consistent column naming if needed
+# colnames(M.tr.Lu.U)  <- c("Stable","Prog","Dead")
+# colnames(M.tr.Cab.U) <- c("Stable","Prog","Dead")
+
+## ---- Costs & Utilities (per-cycle vectors) ----
+# NOTE:
+# - Recurring per-cycle costs are multiplied by OCCUPANCY (U).
+# - One-off AE "lump" handled explicitly as a spike in the Stable column at chosen cycle.
+# - AE disutility applied ONLY in Stable during the first 3 months of treatment to avoid double-count.
+
+# --- Lu-PSMA arm ---
+# Recurring Stable-state items (no AE lump here)
+c.S.PSMA_PET.Lu <- ifelse(times == 0, 5689, 0)        # imaging at t=0 (this is effectively one-off; okay to add into Stable vector)
+c.S.LuPSMA.Lu   <- ifelse(times <= 8, 21375, 0)       # drug cost per cycle while on treatment
+c.S.Blood.Lu    <- ifelse(times <= 8, 387, 0)
+c.S.Physician.Lu<- ifelse(times <= 8, 131, 0)
+c.S.CT.Lu       <- ifelse(times %% 3 == 0 & times <= 9, 2260, 0)
+
+# AE lump kept separate then added to Stable column BEFORE multiplying by occupancy
+AE_Lu_lump      <- ifelse(times == 8, 1564, 0)
+
+# Build total per-cycle Stable/Progressed/Dead costs (recurring)
+c.S.Lu <- c.S.PSMA_PET.Lu + c.S.LuPSMA.Lu + c.S.Blood.Lu + c.S.Physician.Lu + c.S.CT.Lu
+c.P.Lu <- rep(0, length(times))              # was 1564 in your code; moved to AE_Lu_lump to avoid double-count
+c.D.Lu <- rep(17312, length(times))
+
+# Utilities (apply AE disutility only in Stable for first 3 months of treatment)
+u.S.Lu.base <- rep(0.76, length(times))
+u.P.Lu.base <- rep(0.37, length(times))
+u.D.Lu      <- rep(0,    length(times))
+
+on_tx_Lu <- times <= 8
+u.S.DU.Lu <- ifelse(on_tx_Lu & times <= 3, -0.06, 0)
+u.P.DU.Lu <- rep(0, length(times))   # avoid double-count
+
+u.S.Lu <- u.S.Lu.base + u.S.DU.Lu
+u.P.Lu <- u.P.Lu.base + u.P.DU.Lu
+
+# --- Cabazitaxel arm ---
+c.S.PSMA_PET.Cab   <- ifelse(times == 0, 5689, 0)
+c.S.Cabazitaxel.Cab<- ifelse(times <= 7, 19176, 0)
+c.S.Blood.Cab      <- ifelse(times <= 7, 387, 0)
+c.S.Physician.Cab  <- ifelse(times <= 7, 131, 0)
+c.S.CT.Cab         <- ifelse(times %% 3 == 0 & times <= 7, 2260, 0)
+
+AE_Cab_lump        <- ifelse(times == 7, 1535, 0)
+
+c.S.Cab <- c.S.PSMA_PET.Cab + c.S.Cabazitaxel.Cab + c.S.Blood.Cab + c.S.Physician.Cab + c.S.CT.Cab
+c.P.Cab <- rep(0, length(times))              # moved AE to lump
+c.D.Cab <- rep(17312, length(times))
+
+u.S.Cab.base <- rep(0.76, length(times))
+u.P.Cab.base <- rep(0.37, length(times))
+u.D.Cab      <- rep(0,    length(times))
+
+on_tx_Cab <- times <= 7
+u.S.DU.Cab <- ifelse(on_tx_Cab & times <= 3, -0.08, 0)
+u.P.DU.Cab <- rep(0, length(times))
+
+u.S.Cab <- u.S.Cab.base + u.S.DU.Cab
+u.P.Cab <- u.P.Cab.base + u.P.DU.Cab
+
+## ---- Expected costs & QALYs per cycle (via occupancy) ----
+# Multiply occupancy by per-cycle state costs/utilities
+v.tc.Lu.rec  <- M.tr.Lu.U  * cbind(c.S.Lu,  c.P.Lu,  c.D.Lu)
+v.tc.Cab.rec <- M.tr.Cab.U * cbind(c.S.Cab, c.P.Cab, c.D.Cab)
+
+# Add AE one-off lumps to Stable column BEFORE discounting
+v.tc.Lu  <- v.tc.Lu.rec;  v.tc.Lu[, 1] <- v.tc.Lu[, 1] + AE_Lu_lump
+v.tc.Cab <- v.tc.Cab.rec; v.tc.Cab[,1] <- v.tc.Cab[,1] + AE_Cab_lump
+
+# Utilities via occupancy
+v.tu.Lu  <- M.tr.Lu.U  * cbind(u.S.Lu,  u.P.Lu,  u.D.Lu)
+v.tu.Cab <- M.tr.Cab.U * cbind(u.S.Cab, u.P.Cab, u.D.Cab)
+
+## ---- Discount & aggregate ----
+v.tc.d.Lu  <- colSums(t(v.tc.Lu)  %*% v.dwc)         # discounted costs (state-wise)
+v.tc.d.Cab <- colSums(t(v.tc.Cab) %*% v.dwc)
+
+v.te.d.Lu  <- colSums(t(v.tu.Lu)  %*% v.dwe) * (1/12) # discounted QALYs (state-wise)
+v.te.d.Cab <- colSums(t(v.tu.Cab) %*% v.dwe) * (1/12)
+
+# Totals per arm
+tot_cost_Lu  <- sum(v.tc.d.Lu)
+tot_cost_Cab <- sum(v.tc.d.Cab)
+tot_qaly_Lu  <- sum(v.te.d.Lu)
+tot_qaly_Cab <- sum(v.te.d.Cab)
+
+## ---- Incrementals & ICER ----
+delta_cost <- tot_cost_Lu - tot_cost_Cab
+delta_QALY <- tot_qaly_Lu - tot_qaly_Cab
+ICER <- delta_cost / delta_QALY
+
+icer_results <- data.frame(
+  Treatment = c("Cabazitaxel", "Lu-PSMA"),
+  `Total Discounted Cost`  = c(tot_cost_Cab, tot_cost_Lu),
+  `Total Discounted QALYs` = c(tot_qaly_Cab, tot_qaly_Lu),
+  `Incremental Cost`       = c(NA, delta_cost),
+  `Incremental QALY`       = c(NA, delta_QALY),
+  `ICER (Cost per QALY)`   = c(NA, ICER),
+  check.names = FALSE
+)
+
+print(icer_results)

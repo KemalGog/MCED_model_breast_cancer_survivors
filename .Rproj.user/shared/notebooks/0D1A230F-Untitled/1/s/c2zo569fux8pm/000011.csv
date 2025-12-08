@@ -1,0 +1,2 @@
+"0","set.seed(0927)"
+"0","dfSim <- Fun_datagen(Fun.n = 500, Fun.y.type = ""continuous"", Fun.rand = ""SR"", Fun.p = 2/3)"

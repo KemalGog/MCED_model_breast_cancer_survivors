@@ -1,0 +1,1 @@
+"0","print(RobinCar::robincar_linear(df = dfSim, treat_col = ""A"", response_col = ""y"", covariate_cols = c(""Xc"", ""Xb""), adj_method = ""ANCOVA"")$result)"

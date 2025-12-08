@@ -1,0 +1,148 @@
+############################################################
+# 10_cea.R — CEA engine (Weibull + PH scaling); arm-level AE option
+############################################################
+
+suppressPackageStartupMessages({
+  library(tibble)
+  library(dplyr)
+})
+
+# Core CEA for Lu-PSMA vs Cabazitaxel using partitioned survival
+# Inputs:
+#  - wb: list(pfs_shape, pfs_scale, os_shape, os_scale) for Lu-PSMA
+#  - hr: list(pfs_lu_vs_cab, os_lu_vs_cab) from TheraP (Lu vs Cab)
+#  - econ: costs/utilities and program settings (see defaults below)
+run_cea <- function(
+    wb, hr,
+    horizon_months = 60, cycle_len_mo = 1, disc_rate_y = 0.03, WTP = 200000,
+    # costs (Table 1 aligned)
+    use_table1_cycle_costs = TRUE,
+    lu_cost_cycle = 32062,  # per 6 weeks
+    cab_cost_cycle = 14382, # per 3 weeks
+    cost_psma_pet = 5689, cost_ct_per_scan = 2260, ct_every_k_months = 3,
+    cost_blood_mo = 387, cost_phys_mo = 131, terminal_cost = 17312,
+    # treatment windows
+    lu_admin_months = 8, cab_admin_months = 7,
+    # progressed-state routine
+    cP_routine_lu = 1564, cP_routine_cab = 1535,
+    # utilities & AE window
+    u_pfs = 0.76, u_pd = 0.37, ae_months = 4,
+    # AE handling (arm-level averages or incidence-weighted)
+    use_incidence_weighted_AE = TRUE,
+    dU_lu = -0.06, dU_cab = -0.08,             # used if not incidence-weighted
+    AEcost_lu = 1564, AEcost_cab = 1535,       # used if not incidence-weighted
+    ae_tbl = NULL                               # data.frame with inc_Lu, inc_Cab, dU, cost_unit
+) {
+  time <- seq(0, horizon_months, by = cycle_len_mo)
+  cycle_len_y <- cycle_len_mo / 12
+  disc_w <- 1 / (1 + disc_rate_y)^(time * cycle_len_y)
+  
+  # Weibull survivors for Lu
+  S_pfs_lu <- exp(- (time / wb$pfs_scale)^wb$pfs_shape)
+  S_os_lu  <- exp(- (time / wb$os_scale )^wb$os_shape)
+  
+  # Cab via PH scaling of Lu (TheraP HRs are reported as Lu vs Cab)
+  hr_pfs_cab_vs_lu <- hr$pfs_lu_vs_cab
+  hr_os_cab_vs_lu  <- hr$os_lu_vs_cab
+  
+  cab_pfs_scale <- wb$pfs_scale * hr_pfs_cab_vs_lu^(1 / wb$pfs_shape)
+  cab_os_scale  <- wb$os_scale  * hr_os_cab_vs_lu ^(1 / wb$os_shape)
+  
+  S_pfs_cab <- exp(- (time / cab_pfs_scale)^wb$pfs_shape)
+  S_os_cab  <- exp(- (time / cab_os_scale )^wb$os_shape)
+  
+  # Traces & HCC
+  make_trace <- function(S_pfs, S_os) {
+    S <- pmax(pmin(S_pfs, 1), 0)
+    D <- pmax(pmin(1 - S_os, 1), 0)
+    P <- pmax(pmin(S_os - S_pfs, 1), 0)
+    inc_dead <- c(D[1], diff(D)); inc_dead[inc_dead < 0] <- 0
+    inc_prog <- c(P[1], diff(P)); inc_prog[inc_prog < 0] <- 0
+    list(prev = cbind(stable = S, prog = P, dead = D),
+         inc  = cbind(stable = 0*S, prog = inc_prog, dead = inc_dead))
+  }
+  tr_lu  <- make_trace(S_pfs_lu,  S_os_lu)
+  tr_cab <- make_trace(S_pfs_cab, S_os_cab)
+  
+  prev_lu_hcc  <- cbind(stable = hcc_prev(tr_lu$prev[, "stable"]),
+                        prog   = hcc_prev(tr_lu$prev[, "prog"]),
+                        dead   = tr_lu$prev[, "dead"])
+  prev_cab_hcc <- cbind(stable = hcc_prev(tr_cab$prev[, "stable"]),
+                        prog   = hcc_prev(tr_cab$prev[, "prog"]),
+                        dead   = tr_cab$prev[, "dead"])
+  
+  # Per-cycle drug cost (cycle → monthly)
+  lu_cost_drug_mo  <- if (use_table1_cycle_costs) lu_cost_cycle  / 1.5 else lu_cost_cycle
+  cab_cost_drug_mo <- if (use_table1_cycle_costs) cab_cost_cycle / 0.75 else cab_cost_cycle
+  
+  # AE disutility & one-off AE cost per arm
+  if (isTRUE(use_incidence_weighted_AE)) {
+    stopifnot(!is.null(ae_tbl), all(c("inc_Lu","inc_Cab","dU","cost_unit") %in% names(ae_tbl)))
+    dU_lu     <- weighted_avg(ae_tbl$dU,        ae_tbl$inc_Lu)
+    dU_cab    <- weighted_avg(ae_tbl$dU,        ae_tbl$inc_Cab)
+    AEcost_lu <- weighted_avg(ae_tbl$cost_unit, ae_tbl$inc_Lu)
+    AEcost_cab<- weighted_avg(ae_tbl$cost_unit, ae_tbl$inc_Cab)
+  }
+  
+  is_scan_cycle <- (time > 0) & (time %% ct_every_k_months == 0)
+  
+  # S-state routine costs
+  cS_Lu <- numeric(length(time))
+  cS_Lu[time == 0]                      <- cS_Lu[time == 0] + cost_psma_pet
+  cS_Lu[time <= lu_admin_months]        <- cS_Lu[time <= lu_admin_months] +
+    (lu_cost_drug_mo + cost_blood_mo + cost_phys_mo)
+  cS_Lu[is_scan_cycle & time <= lu_admin_months] <- cS_Lu[is_scan_cycle & time <= lu_admin_months] + cost_ct_per_scan
+  cS_Lu[time == lu_admin_months]        <- cS_Lu[time == lu_admin_months] + AEcost_lu
+  
+  cS_Cab <- numeric(length(time))
+  cS_Cab[time == 0]                        <- cS_Cab[time == 0] + cost_psma_pet
+  cS_Cab[time <= cab_admin_months]         <- cS_Cab[time <= cab_admin_months] +
+    (cab_cost_drug_mo + cost_blood_mo + cost_phys_mo)
+  cS_Cab[is_scan_cycle & time <= cab_admin_months] <- cS_Cab[is_scan_cycle & time <= cab_admin_months] + cost_ct_per_scan
+  cS_Cab[time == cab_admin_months]         <- cS_Cab[time == cab_admin_months] + AEcost_cab
+  
+  # Progressed-state routine (per month)
+  cP_Lu_routine  <- rep(cP_routine_lu,  length(time))
+  cP_Cab_routine <- rep(cP_routine_cab, length(time))
+  cP_Lu_transition  <- rep(0, length(time))
+  cP_Cab_transition <- rep(0, length(time))
+  
+  # Terminal cost (incident deaths)
+  cD_Lu_terminal  <- rep(terminal_cost, length(time))
+  cD_Cab_terminal <- rep(terminal_cost, length(time))
+  
+  # Utilities (AE disutility during first `ae_months`)
+  uS_Lu <- rep(u_pfs, length(time)); uS_Lu[time <= ae_months]  <- uS_Lu[time <= ae_months]  + dU_lu
+  uP_Lu <- rep(u_pd,  length(time)); uP_Lu[time <= ae_months]  <- uP_Lu[time <= ae_months]  + dU_lu
+  uS_Cab<- rep(u_pfs, length(time)); uS_Cab[time <= ae_months] <- uS_Cab[time <= ae_months] + dU_cab
+  uP_Cab<- rep(u_pd,  length(time)); uP_Cab[time <= ae_months] <- uP_Cab[time <= ae_months] + dU_cab
+  
+  # Accumulators
+  accumulate_arm <- function(prev_hcc, inc, cS, cP_routine, cP_trans, cD_term, uS, uP, disc_w, cycle_len_y) {
+    cost_routine <- prev_hcc[, "stable"] * cS + prev_hcc[, "prog"] * cP_routine
+    cost_trans   <- inc[, "prog"] * cP_trans + inc[, "dead"] * cD_term
+    cost_per_cyc <- (cost_routine + cost_trans) * disc_w
+    qaly_per_cyc <- (prev_hcc[, "stable"] * uS + prev_hcc[, "prog"] * uP) * cycle_len_y * disc_w
+    list(cost = sum(cost_per_cyc), qaly = sum(qaly_per_cyc))
+  }
+  
+  lu  <- accumulate_arm(prev_lu_hcc,  tr_lu$inc,  cS_Lu,  cP_Lu_routine,  cP_Lu_transition,  cD_Lu_terminal,  uS_Lu,  uP_Lu,  disc_w, cycle_len_y)
+  cab <- accumulate_arm(prev_cab_hcc, tr_cab$inc, cS_Cab, cP_Cab_routine, cP_Cab_transition, cD_Cab_terminal, uS_Cab, uP_Cab, disc_w, cycle_len_y)
+  
+  delta_cost <- lu$cost - cab$cost
+  delta_qaly <- lu$qaly - cab$qaly
+  
+  list(
+    totals = tibble::tibble(
+      Treatment = c("Cabazitaxel", "Lu-PSMA"),
+      Total_Discounted_Cost  = c(cab$cost, lu$cost),
+      Total_Discounted_QALYs = c(cab$qaly, lu$qaly)
+    ),
+    delta_cost = delta_cost,
+    delta_qaly = delta_qaly,
+    ICER = delta_cost / delta_qaly,
+    NMB = c(Cabazitaxel = cab$qaly * WTP - cab$cost,
+            LuPSMA      = lu$qaly * WTP - lu$cost),
+    delta_NMB = (lu$qaly * WTP - lu$cost) - (cab$qaly * WTP - cab$cost)
+  )
+}

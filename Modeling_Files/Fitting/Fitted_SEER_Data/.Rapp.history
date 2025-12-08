@@ -1,0 +1,3 @@
+load("/Users/kgogebak/Library/CloudStorage/OneDrive-FredHutchinsonCancerCenter/MCED Modeling for breast cancer survivors/Model breast cancer survivors/Fitted SEER Data_Last/lungoutfile_hr_neg.Rdata")
+load("/Users/kgogebak/Library/CloudStorage/OneDrive-FredHutchinsonCancerCenter/MCED Modeling for breast cancer survivors/Model breast cancer survivors/Fitted SEER Data_Last/bladderoutfile_hr_base.Rdata")
+load("/Users/kgogebak/Library/CloudStorage/OneDrive-FredHutchinsonCancerCenter/MCED Modeling for breast cancer survivors/Model breast cancer survivors_September/Data/Fitted SEER Data/anusoutfile_hr_base.Rdata")

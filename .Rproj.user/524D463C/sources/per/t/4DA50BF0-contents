@@ -1,0 +1,753 @@
+############################################################
+# 99_main.R — minimal application script
+############################################################
+setwd("~/OneDrive - Fred Hutchinson Cancer Center/Luteitium Cost Effectiveness/Model")
+
+suppressPackageStartupMessages({
+  library(tibble)
+})
+
+# --- 1) Helpers
+source("00_helpers.R")
+
+# --- 2) Load Fred Hutch Lu-PSMA patient dataset
+source("01_data.R")
+dat <- load_patient_data('~/OneDrive - Fred Hutchinson Cancer Center/Luteitium Cost Effectiveness/Data/patient-data-processed.RData')
+df <- dat$data
+
+# --- 3) KM curves of Lu-PSMA cohort (OS, PFS)
+source("02_km.R")
+plot_km_curves(df, out_dir = "figs")
+
+# --- 4) Fit survival curves for OS and PFS (AIC tables for supplement)
+source("SurvFunctions_final.R")
+source("03_fit_survival.R")
+
+# For fit.fun() plotting helpers
+n.t <- 60        # number of cycles to run
+c.l <- 1         # cycle length (months)
+times <- seq(0, n.t, by = c.l)
+
+# Use Lu-PSMA dataset for survival fit
+
+fit_out <- fit_survival_models(df, fit_fun = fit.fun)
+write_aic_tables(fit_out$aic_tables, out_dir = "supp")
+
+# Pick Weibull fit (best AIC) 
+
+wb <- fit_out$weibull_est 
+
+# --- 5) CEA function
+source("10_cea.R")
+
+# TheraP treatment efficacy (Lu-PSMA vs Cabazitaxel): PFS HR ~ 0.60 (0.44-0.83); OS HR ~ 0.96 (0.51-1.79) (no diff)
+
+hr <- list(pfs_lu_vs_cab = 0.60, os_lu_vs_cab = 0.96)
+
+# Example AE table (weighted average)
+ae_tbl <- tibble::tribble(
+  ~AE,                ~inc_Lu, ~inc_Cab, ~dU,     ~cost_unit,
+  "Fatigue",           0.05,    0.04,    -0.473,   8437,
+  "Back pain",         0.03,    0.00,    -0.067,  10728,
+  "Bone pain",         0.01,    0.00,    -0.067,   3577,
+  "Diarrhea",          0.01,    0.05,    -0.180,   9738,
+  "Nausea",            0.01,    0.00,    -0.210,  11934,
+  "Thrombocytopenia",  0.11,    0.00,    -0.090,    166,
+  "Anaemia",           0.08,    0.08,    -0.119,    971,
+  "Neuropathy",        0.00,    0.01,    -0.174,    783,
+  "Haematuria",        0.01,    0.06,    -0.260,    461,
+  "Neutropenia",       0.04,    0.13,    -0.131,    166,
+  "Insomnia",          0.00,    0.01,    -0.090,    400,
+  "Vomiting",          0.01,    0.02,    -0.230,  11934,
+  "Leukopenia",        0.01,    0.01,    -0.090,    166
+)
+
+# --- 6) Application: Base analysis
+cea_args <- list(
+  wb = wb, hr = hr,
+  horizon_months = 60, cycle_len_mo = 1, disc_rate_y = 0.03, WTP = 200000,
+  use_table1_cycle_costs = TRUE,
+  lu_cost_cycle = 32062, cab_cost_cycle = 14382,
+  cost_psma_pet = 5689, cost_ct_per_scan = 2260, ct_every_k_months = 3,
+  cost_blood_mo = 387, cost_phys_mo = 131, terminal_cost = 17312,
+  lu_admin_months = 8, cab_admin_months = 7,
+  cP_routine_lu = 1564, cP_routine_cab = 1535,
+  u_pfs = 0.76, u_pd = 0.37, ae_months = 4,
+  use_incidence_weighted_AE = TRUE,
+  ae_tbl = ae_tbl
+)
+
+base_out <- do.call(run_cea, cea_args)
+
+cat("\n=== Base-case totals ===\n")
+print(base_out$totals)
+cat("\nΔCost =", round(base_out$delta_cost,2),
+    "| ΔQALY =", round(base_out$delta_qaly,3),
+    "| ICER =", round(base_out$ICER,0),
+    "| ΔNMB =", round(base_out$delta_NMB,0), "\n")
+
+source("write_cea_results_word.R")
+write_cea_results_word(base_out, "supp/CEA_basecase.docx")
+
+############################################################
+# --- 7) One Way Sensitivity Analysis (OWSA)
+############################################################
+# --- OWSA settings (only define if not already present) ---
+if (!exists("WTP"))   WTP   <- 200000     # USD/QALY
+if (!exists("x_cap")) x_cap <- 1e6        # ICER plot clip
+
+if (!exists("owsa_ranges")) {
+  owsa_ranges <- tibble::tibble(
+    param = c(
+      # Survival & HRs
+      "wb.pfs_shape","wb.pfs_scale","wb.os_shape","wb.os_scale",
+      "hr.pfs_lu_vs_cab","hr.os_lu_vs_cab",
+      # Costs
+      "lu_cost_cycle","cab_cost_cycle","cost_psma_pet","cost_ct_per_scan",
+      "cost_blood_mo","cost_phys_mo","terminal_cost",
+      # Utilities & AEs
+      "u_pfs","u_pd","dU_lu","dU_cab","AEcost_lu","AEcost_cab"
+    ),
+    low  = c(
+      0.70, 12, 0.6, 10,
+      0.44, 0.70,
+      25649, 11505, 4551, 1808, 310, 105, 13849,
+      0.65, 0.33, -0.072, -0.096, 1564*0.8, 1535*0.8
+    ),
+    high = c(
+      1.35, 18, 1.2, 16,
+      0.83, 1.35,
+      38474, 17852, 6829, 2712, 464, 157, 20773,
+      0.87, 0.41, -0.048, -0.064, 1564*1.2, 1535*1.2
+    )
+  )
+}
+############################################################
+# --- OWSA: decision-aware tornado (ready to run)
+############################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(purrr)
+  library(tibble); library(tidyr);  library(scales); library(stringr)
+})
+
+# --- 0) Use base args but switch to arm-level AE so the dU/AEcost ranges matter
+cea_args_ow <- cea_args
+cea_args_ow$use_incidence_weighted_AE <- FALSE
+
+# --- 1) Pretty labels and bound formatting
+pretty_param_names <- function(x) {
+  dplyr::recode(
+    x,
+    "wb.pfs_shape"     = "Weibull shape (PFS, Lu-PSMA)",
+    "wb.pfs_scale"     = "Weibull scale (PFS, Lu-PSMA)",
+    "wb.os_shape"      = "Weibull shape (OS, Lu-PSMA)",
+    "wb.os_scale"      = "Weibull scale (OS, Lu-PSMA)",
+    "hr.pfs_lu_vs_cab" = "TheraP HR (PFS, Lu vs Cab)",
+    "hr.os_lu_vs_cab"  = "TheraP HR (OS, Lu vs Cab)",
+    "lu_cost_cycle"    = "Lu-PSMA: cost per cycle",
+    "cab_cost_cycle"   = "Cabazitaxel: cost per cycle",
+    "cost_psma_pet"    = "PSMA-PET/CT (one-off)",
+    "cost_ct_per_scan" = "CT / bone scan (per scan)",
+    "cost_blood_mo"    = "Blood tests (monthly)",
+    "cost_phys_mo"     = "Physician visit (monthly)",
+    "terminal_cost"    = "End-of-life cost (one-off)",
+    "u_pfs"            = "Utility: progression-free",
+    "u_pd"             = "Utility: progressed disease",
+    "dU_lu"            = "AE disutility (Lu-PSMA, per mo)",
+    "dU_cab"           = "AE disutility (Cabazitaxel, per mo)",
+    "AEcost_lu"        = "AE cost (Lu-PSMA, one-off)",
+    "AEcost_cab"       = "AE cost (Cabazitaxel, one-off)",
+    .default = x
+  )
+}
+
+format_bounds_vec <- function(param, low, high) {
+  money_params <- c(
+    "lu_cost_cycle","cab_cost_cycle","cost_psma_pet","cost_ct_per_scan",
+    "cost_blood_mo","cost_phys_mo","terminal_cost","AEcost_lu","AEcost_cab"
+  )
+  is_money <- param %in% money_params
+  out <- character(length(param))
+  out[ is_money] <- paste0(" (", comma(low[ is_money], accuracy = 1),
+                           "–", comma(high[ is_money], accuracy = 1), ")")
+  out[!is_money] <- paste0(" (", signif(low[!is_money], 3),
+                           "–", signif(high[!is_money], 3), ")")
+  out
+}
+
+# --- 2) Boundaries and evaluation helpers
+set_nested_value <- function(x, dotted_name, value) {
+  parts <- strsplit(dotted_name, ".", fixed = TRUE)[[1]]
+  if (length(parts) == 1) { x[[parts[1]]] <- value; return(x) }
+  head_name <- parts[1]
+  tail_path <- paste(parts[-1], collapse = ".")
+  if (is.null(x[[head_name]])) x[[head_name]] <- list()
+  x[[head_name]] <- set_nested_value(x[[head_name]], tail_path, value)
+  x
+}
+run_cea_with <- function(base_args, dotted_param, value) {
+  args2 <- set_nested_value(base_args, dotted_param, value)
+  do.call(run_cea, args2)
+}
+eval_delta <- function(base_args, param, value) {
+  out <- run_cea_with(base_args, param, value)
+  list(d_cost = as.numeric(out$delta_cost), d_qaly = as.numeric(out$delta_qaly))
+}
+safe_uniroot <- function(f, a, b) {
+  fa <- f(a); fb <- f(b)
+  if (!is.finite(fa) || !is.finite(fb)) return(numeric(0))
+  if (fa == 0) return(a)
+  if (fb == 0) return(b)
+  if (fa * fb > 0) return(numeric(0))
+  tryCatch(uniroot(f, c(a, b))$root, error = function(...) numeric(0))
+}
+dec_class <- function(dc, dq, wtp) {
+  if (dq > 0) { if (dc < 0) "Dominant" else if (dc - wtp*dq < 0) "Cost-effective" else "Not cost-effective" }
+  else { if (dc >= 0) "Dominated" else "Not cost-effective" }
+}
+
+split_param_interval <- function(base_args, param, low, high, WTP,
+                                 pretty_label, bounds_label, x_cap = 1e6) {
+  g1 <- function(v) eval_delta(base_args, param, v)$d_cost
+  g2 <- function(v) eval_delta(base_args, param, v)$d_qaly
+  g3 <- function(v) { dd <- eval_delta(base_args, param, v); dd$d_cost - WTP*dd$d_qaly }
+  
+  pts  <- c(safe_uniroot(g1, low, high), safe_uniroot(g2, low, high), safe_uniroot(g3, low, high))
+  cuts <- sort(unique(c(low, pts[is.finite(pts)], high)))
+  
+  cap  <- function(x) { s <- sign(x); x <- pmin(abs(x), x_cap); s * x }
+  
+  map2_dfr(head(cuts, -1), tail(cuts, -1), function(a, b) {
+    dl <- eval_delta(base_args, param, a)
+    dh <- eval_delta(base_args, param, b)
+    icer_a <- dl$d_cost / dl$d_qaly
+    icer_b <- dh$d_cost / dh$d_qaly
+    class_a <- dec_class(dl$d_cost, dl$d_qaly, WTP)
+    class_b <- dec_class(dh$d_cost, dh$d_qaly, WTP)
+    tibble(
+      param        = param,
+      param_label  = paste0(pretty_label, bounds_label),
+      a = a, b = b,
+      dC_a = dl$d_cost, dQ_a = dl$d_qaly, ICER_a = icer_a,
+      dC_b = dh$d_cost, dQ_b = dh$d_qaly, ICER_b = icer_b,
+      ICER_a_plot = cap(icer_a), ICER_b_plot = cap(icer_b),
+      class = if (identical(class_a, class_b)) class_a else paste(class_a, "→", class_b)
+    )
+  })
+}
+
+# --- 3) Pull your ranges (you posted them above)
+stopifnot(exists("owsa_ranges"))
+WTP   <- 200000
+x_cap <- 1e6
+
+ranges0 <- owsa_ranges %>%
+  mutate(pretty = pretty_param_names(param),
+         bounds = format_bounds_vec(param, low, high))
+
+# Split OS HR at 1.00 into two rows when interval crosses 1
+split_os_rows <- function(df) {
+  i <- which(df$param == "hr.os_lu_vs_cab")
+  if (length(i) == 0) return(df)
+  row <- df[i[1], ]
+  if (row$low < 1 && row$high > 1) {
+    lower <- row; lower$high <- 1.0
+    upper <- row; upper$low  <- 1.0
+    lower$pretty <- paste0(pretty_param_names("hr.os_lu_vs_cab"), " (low→1.00)")
+    upper$pretty <- paste0(pretty_param_names("hr.os_lu_vs_cab"), " (1.00→high)")
+    lower$bounds <- format_bounds_vec(lower$param, lower$low, lower$high)
+    upper$bounds <- format_bounds_vec(upper$param, upper$low, upper$high)
+    bind_rows(df[-i[1], ], lower, upper)
+  } else df
+}
+drivers <- ranges0 %>% split_os_rows()
+
+# --- 4) Build all segments
+segments_all <- pmap_dfr(
+  drivers,
+  ~ split_param_interval(
+    base_args     = cea_args_ow,
+    param         = ..1,
+    low           = ..2,
+    high          = ..3,
+    WTP           = WTP,
+    pretty_label  = ..4,
+    bounds_label  = ..5,
+    x_cap         = x_cap
+  )
+)
+
+# order rows by total span across segments
+order_levels <- segments_all %>%
+  group_by(param_label) %>%
+  summarise(width = sum(abs(ICER_b_plot - ICER_a_plot), na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(width)) %>% pull(param_label)
+segments_all$param_label <- factor(segments_all$param_label, levels = rev(order_levels))
+
+# --- 5) Plot
+pal <- c(
+  "Dominant"           = "#1B9E77",
+  "Cost-effective"     = "#66A61E",
+  "Not cost-effective" = "#D95F02",
+  "Dominated"          = "#E7298A"
+)
+
+p_tornado <- ggplot(segments_all) +
+  geom_segment(
+    aes(y = param_label, yend = param_label,
+        x = ICER_a_plot, xend = ICER_b_plot, color = class),
+    linewidth = 6, lineend = "round"
+  ) +
+  geom_vline(xintercept = 0,   linetype = "dotted", linewidth = 0.9) +
+  geom_vline(xintercept = WTP, linetype = "dashed", linewidth = 0.9) +
+  scale_color_manual(values = pal, drop = FALSE) +
+  scale_x_continuous(labels = dollar_format(accuracy = 1), limits = c(-x_cap, x_cap)) +
+  labs(
+    title    = "One-way Sensitivity Analysis (ICER)",
+    subtitle = paste0("Bars split at WTP = $", comma(WTP),
+                      " — green: ICER < WTP (cost-effective)"),
+    x = "Incremental Cost per QALY (ICER; clipped to ±1e6)", y = NULL, color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.y        = element_text(size = 10.5, hjust = 1),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    legend.position    = "top"
+  )
+
+dir.create("supp", showWarnings = FALSE, recursive = TRUE)
+ggsave("supp/OWSA_ICER_tornado_DECISION.png", p_tornado, width = 9, height = 7, dpi = 300)
+print(p_tornado)
+
+# --- 6) Endpoint table (ICER & decision at low/high)
+endpoint_table <- drivers %>%
+  rowwise() %>%
+  mutate(
+    lo = list(eval_delta(cea_args_ow, param, low)),
+    hi = list(eval_delta(cea_args_ow, param, high)),
+    ICER_low   = lo$d_cost / lo$d_qaly,
+    ICER_high  = hi$d_cost / hi$d_qaly,
+    Class_low  = dec_class(lo$d_cost, lo$d_qaly, WTP),
+    Class_high = dec_class(hi$d_cost, hi$d_qaly, WTP),
+    Parameter  = paste0(pretty_param_names(param), format_bounds_vec(param, low, high))
+  ) %>% ungroup() %>%
+  transmute(
+    Parameter,
+    `ICER (low)`  = ifelse(is.finite(ICER_low),  round(ICER_low),  NA),
+    `ICER (high)` = ifelse(is.finite(ICER_high), round(ICER_high), NA),
+    `Decision (low)`  = Class_low,
+    `Decision (high)` = Class_high
+  )
+
+readr::write_csv(endpoint_table, "supp/OWSA_ICER_table.csv")
+endpoint_table
+
+############################################################
+# --- 8) Probabilistic Sensitivity Analysis (PSA)
+############################################################
+
+source("30_psa.R")
+
+# 0) Make sure both wb and wb_ci exist from your survival fit
+wb     <- fit_out$weibull_est
+wb_ci  <- fit_out$weibull_ci   # <-- this line fixes the missing object
+
+# 1) HR CIs from TheraP (Lu vs Cab). Use your manuscript values.
+hr_ci <- list(
+  pfs = list(est = 0.60, lcl = 0.44, ucl = 0.83),
+  os  = list(est = 1.00, lcl = 0.70, ucl = 1.35)
+)
+
+# 2) Table 1 bounds (means & 95% CI)
+table1_bounds <- list(
+  lu_cost_cycle  = list(mean = 32062, lcl = 25649, ucl = 38474),
+  cab_cost_cycle = list(mean = 14382, lcl = 11505, ucl = 17852),
+  psma_pet       = list(mean = 5689,  lcl = 4551,  ucl = 6829),
+  ct_scan        = list(mean = 2260,  lcl = 1808,  ucl = 2712),
+  blood          = list(mean = 387,   lcl = 310,   ucl = 464),
+  phys           = list(mean = 131,   lcl = 105,   ucl = 157),
+  terminal       = list(mean = 17312, lcl = 13849, ucl = 20773),
+  # exact beta params for utilities (optional but preferred)
+  u_pfs          = list(alpha = 44,  beta = 13.9),   # mean ≈ 0.76
+  u_pd           = list(alpha = 207, beta = 353)     # mean ≈ 0.37
+)
+
+# 3) Arm-level AE summary (used if NOT using incidence-weighted AEs in PSA)
+ae_arm_means <- list(
+  dU_lu      = list(mean = -0.06,  lower = -0.072, upper = -0.048),
+  dU_cab     = list(mean = -0.08,  lower = -0.096, upper = -0.064),
+  AEcost_lu  = list(mean = 1564,   lower = 1564*0.8,  upper = 1564*1.2),
+  AEcost_cab = list(mean = 1535,   lower = 1535*0.8,  upper = 1535*1.2)
+)
+
+# 4) Build PSA spec
+psa_spec <- build_psa_spec(
+  wb = wb,
+  wb_ci = wb_ci,
+  hr_ci = hr_ci,
+  table1_bounds = table1_bounds,
+  ae_mode = "arm",                 # or "incidence" if you want to sample from ae_tbl
+  ae_arm_means = ae_arm_means
+)
+
+# 5) Override run_psa() to match YOUR run_cea() outputs
+#    (Your run_cea returns: totals tibble + delta_cost, delta_qaly, ICER, delta_NMB)
+run_psa_compat <- function(N, base_cea_args, spec,
+                           seed = 123, use_incidence_weighted_AE = FALSE, WTP = 200000) {
+  set.seed(seed)
+  sims <- purrr::map(1:N, function(i) {
+    drw    <- draw_one(spec)
+    args_i <- apply_draw_to_args(base_cea_args, drw, use_incidence_weighted_AE)
+    out    <- do.call(run_cea, args_i)
+    
+    # pull costs/QALYs for each arm from the 'totals' tibble
+    get_val <- function(col, trt) {
+      out$totals[[col]][out$totals$Treatment == trt]
+    }
+    cost_Lu  <- get_val("Total_Discounted_Cost",  "Lu-PSMA")
+    qaly_Lu  <- get_val("Total_Discounted_QALYs", "Lu-PSMA")
+    cost_Cab <- get_val("Total_Discounted_Cost",  "Cabazitaxel")
+    qaly_Cab <- get_val("Total_Discounted_QALYs", "Cabazitaxel")
+    
+    tibble::tibble(
+      sim = i,
+      cost_Lu  = cost_Lu,
+      qaly_Lu  = qaly_Lu,
+      cost_Cab = cost_Cab,
+      qaly_Cab = qaly_Cab,
+      dCost    = out$delta_cost,
+      dQALY    = out$delta_qaly,
+      ICER     = out$ICER,
+      dNMB     = out$delta_NMB,
+      WTP      = args_i$WTP %||% WTP
+    )
+  })
+  dplyr::bind_rows(sims)
+}
+
+# 6) Run PSA
+dir.create("supp", showWarnings = FALSE, recursive = TRUE)
+
+N <- 10000
+psa_df <- run_psa_compat(
+  N = N,
+  base_cea_args = cea_args,
+  spec = psa_spec,
+  seed = 123,
+  use_incidence_weighted_AE = FALSE,   # set TRUE if sampling AE incidences instead
+  WTP = 200000
+)
+
+# 7) Publication-ready PSA plots
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+# --- Define a consistent publication theme ---
+theme_pub <- theme_bw(base_size = 12, base_family = "Times") +
+  theme(
+    panel.border = element_rect(color = "black"),
+    panel.grid.major = element_line(color = "gray90", size = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "none"
+  )
+
+
+# --- (a) Cost-effectiveness plane (revised) ---
+p_plane_fancy <- ggplot(psa_df, aes(x = dQALY, y = dCost)) +
+  geom_hline(yintercept = 0, color = "gray60", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "gray60", linewidth = 0.4) +
+  geom_abline(intercept = 0, slope = 200000, linetype = "dashed", color = "black") +
+  geom_point(color = "#1f78b4", alpha = 0.25, size = 1.2) +
+  stat_ellipse(level = 0.95, color = "black", linetype = "solid", linewidth = 0.5) +
+  geom_point(aes(x = mean(dQALY), y = mean(dCost)),
+             shape = 17, color = "#e66101", size = 3) +
+  labs(
+    x = "Incremental QALYs",
+    y = "Incremental Cost",
+  ) +
+  # Fixed range + custom tick increments
+  scale_x_continuous(
+    limits = c(-0.2, 0.4),
+    breaks = seq(-0.2, 0.4, by = 0.1)
+  ) +
+  scale_y_continuous(
+    limits = c(-25000, 100000),
+    breaks = seq(-25000, 100000, by = 25000),
+    labels = scales::dollar_format(prefix = "$", big.mark = ",", accuracy = 1)
+  ) +
+  theme_bw(base_size = 16, base_family = "Arial") +
+  theme(
+    panel.border = element_rect(color = "black"),
+    panel.grid.major = element_line(color = "gray90", size = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 18)
+  )
+
+# --- (b) Cost-effectiveness acceptability curve (CEAC) ---
+wtp_grid <- seq(50000, 300000, by = 10000)
+ceac_df <- lapply(wtp_grid, function(wtp) {
+  data.frame(WTP = wtp,
+             p_CE = mean((psa_df$dQALY * wtp - psa_df$dCost) >= 0))
+}) %>% bind_rows()
+
+p_ceac_fancy <- ggplot(ceac_df, aes(x = WTP, y = p_CE)) +
+  geom_line(color = "#1f78b4", linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "gray50") +
+  scale_x_continuous(labels = dollar_format(scale = 1e-0)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Willingness-to-pay threshold (USD per QALY)",
+    y = "Probability cost-effective",
+    title = "Cost-Effectiveness Acceptability Curve"
+  ) +
+  theme_pub
+
+# --- Save publication-quality TIFFs ---
+ggsave("supp/PSA_CE_plane_pub.tiff", p_plane_fancy, width = 7, height = 5, dpi = 600, compression = "lzw")
+ggsave("supp/PSA_CEAC_pub.tiff", p_ceac_fancy, width = 7, height = 5, dpi = 600, compression = "lzw")
+# 8) Summary tables
+summary_stats <- psa_df %>%
+  dplyr::summarize(
+    mean_dCost = mean(dCost),  sd_dCost = sd(dCost),
+    mean_dQALY = mean(dQALY),  sd_dQALY = sd(dQALY),
+    mean_ICER  = mean(ICER[is.finite(ICER)]),
+    p_CE_200k  = mean((dQALY * 200000 - dCost) >= 0)
+  )
+
+write.csv(psa_df,       "supp/PSA_draws.csv",    row.names = FALSE)
+write.csv(summary_stats,"supp/PSA_summary.csv",  row.names = FALSE)
+
+print(summary_stats)
+
+
+#REPORTssss###
+
+## --- A) % cost-effective at common WTP thresholds
+wtps_report <- c(50000, 100000, 200000)
+
+ce_tbl <- sapply(wtps_report, function(w) {
+  mean(psa_df$dQALY * w - psa_df$dCost >= 0)
+})
+
+# pretty print
+data.frame(
+  WTP = paste0("$", format(wtps_report, big.mark=","), "/QALY"),
+  P_cost_effective = round(ce_tbl, 4)
+)
+
+## --- B) Quadrant distribution on the CE plane
+# Quadrants (x = ΔQALY, y = ΔCost):
+#  - Lower Right (LR):  ΔQALY > 0 & ΔCost < 0  => dominant
+#  - Upper Right (UR):  ΔQALY > 0 & ΔCost > 0
+#  - Lower Left  (LL):  ΔQALY < 0 & ΔCost < 0
+#  - Upper Left  (UL):  ΔQALY < 0 & ΔCost > 0  => dominated
+
+quad <- with(psa_df, dplyr::case_when(
+  dQALY > 0 & dCost < 0 ~ "LR (dominant)",
+  dQALY > 0 & dCost > 0 ~ "UR",
+  dQALY < 0 & dCost < 0 ~ "LL",
+  dQALY < 0 & dCost > 0 ~ "UL (dominated)",
+  TRUE                  ~ "On axes"
+))
+
+quad_tab <- prop.table(table(quad)) * 100
+round(quad_tab, 1)
+
+## --- C) One-liner text for Results (example at WTP = $100,000/QALY)
+wtp <- 50000
+p_ce <- mean(psa_df$dQALY * wtp - psa_df$dCost >= 0) * 100
+
+paste0(
+  "Probabilistic sensitivity analysis over 36 months indicated that ",
+  sprintf("%.2f", p_ce), "% of simulations were cost-effective at a WTP of $",
+  format(wtp, big.mark=","), "/QALY. Quadrant distribution was: ",
+  sprintf("%.1f", 100 * mean(quad == "LR (dominant)")), "% lower-right (dominant); ",
+  sprintf("%.1f", 100 * mean(quad == "UR")), "% upper-right; ",
+  sprintf("%.1f", 100 * mean(quad == "LL")), "% lower-left; ",
+  sprintf("%.1f", 100 * mean(quad == "UL (dominated)")), "% upper-left (dominated)."
+)
+
+## --- CEAC from PSA draws (two-strategy case: Lu-PSMA vs Cabazitaxel)
+ce_prob <- function(wtp) mean(psa_df$dQALY * wtp - psa_df$dCost >= 0)
+
+# 1) Build CEAC over a grid
+wtp_grid <- seq(0, 300000, by = 1000)
+p_ce     <- vapply(wtp_grid, ce_prob, numeric(1))
+
+# 2) Find the WTP* where P(cost-effective) = 0.5
+#    (returns NA if it never crosses 50% on the searched interval)
+find_wtp_star <- function(lo = 0, hi = 500000){
+  f <- function(w) ce_prob(w) - 0.5
+  flo <- f(lo); fhi <- f(hi)
+  if (!is.finite(flo) || !is.finite(fhi) || flo * fhi > 0) return(NA_real_)
+  uniroot(f, interval = c(lo, hi))$root
+}
+
+wtp_star <- find_wtp_star()
+
+# 3) Plot CEAC and mark the 50% point
+library(ggplot2); library(scales)
+df_ceac <- data.frame(WTP = wtp_grid, pCE = p_ce)
+
+ggplot(df_ceac, aes(WTP, pCE)) +
+  geom_line() +
+  geom_hline(yintercept = 0.5, linetype = "dotted") +
+  { if (!is.na(wtp_star)) geom_vline(xintercept = wtp_star, linetype = "dashed") } +
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0,1)) +
+  labs(x = "Willingness-to-pay (USD per QALY)", y = "Probability Lu-PSMA is cost-effective",
+       title = "Cost-Effectiveness Acceptability Curve (CEAC)") +
+  theme_bw()
+
+# 4) Nicely report the crossing (if it exists)
+if (is.na(wtp_star)) {
+  message("No 50% crossing on [0, $500,000/QALY]: model is either <50% for all WTPs or >50% for all WTPs.")
+} else {
+  cat("WTP where Lu-PSMA reaches 50% probability of being cost-effective:",
+      scales::dollar(wtp_star), "per QALY\n")
+}
+
+## --- CEAC from PSA draws (requires psa_df with columns dQALY, dCost) ---
+
+stopifnot(all(c("dQALY","dCost") %in% names(psa_df)))
+
+library(ggplot2)
+library(scales)
+library(dplyr)
+
+# 1) Compute CEAC across a WTP grid
+wtp_grid <- seq(0, 300000, by = 1000)
+ceac_df <- data.frame(
+  WTP  = wtp_grid,
+  p_CE = sapply(wtp_grid, function(wtp) mean(psa_df$dQALY * wtp - psa_df$dCost >= 0))
+)
+
+# 2) Find the 50% crossover WTP (where p_CE = 0.5)
+find_wtp_star <- function(df) {
+  f <- function(w) approx(df$WTP, df$p_CE, xout = w, rule = 2)$y - 0.5
+  if (f(min(df$WTP)) > 0) return(min(df$WTP))             # already ≥50% at lowest WTP
+  if (f(max(df$WTP)) < 0) return(NA_real_)                # never reaches 50% on the grid
+  uniroot(f, interval = range(df$WTP))$root
+}
+wtp_star <- find_wtp_star(ceac_df)
+
+cat("50% CE crossover at:", ifelse(is.na(wtp_star), "not reached on grid",
+                                   dollar(round(wtp_star, 0))), "\n")
+
+# 3) Report CE probabilities at common WTP thresholds
+wtp_points <- c(50000, 100000, 200000)
+ce_probs <- sapply(wtp_points, function(w) approx(ceac_df$WTP, ceac_df$p_CE, xout = w)$y)
+report_tbl <- data.frame(WTP = wtp_points,
+                         Prob_CE = ce_probs) %>%
+  mutate(WTP_label = dollar(WTP),
+         Prob_label = percent(Prob_CE, accuracy = 0.1))
+print(report_tbl[,c("WTP_label","Prob_label")], row.names = FALSE)
+
+# 4) Plot CEAC
+p_ceac <- ggplot(ceac_df, aes(x = WTP, y = p_CE)) +
+  geom_line(linewidth = 1, color = "#1f78b4") +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "gray40") +
+  { if (!is.na(wtp_star)) geom_vline(xintercept = wtp_star, linetype = "dashed", color = "gray40") } +
+  { if (!is.na(wtp_star)) annotate("text", x = wtp_star, y = 0.55,
+                                   label = paste0("50% CE at ", dollar(round(wtp_star,0))),
+                                   hjust = -0.1, size = 3.3) } +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0,1)) +
+  labs(x = "Willingness-to-pay (USD per QALY)",
+       y = "Probability Lu-PSMA is cost-effective",
+       title = "Cost-Effectiveness Acceptability Curve (CEAC)") +
+  theme_bw(base_size = 12)
+
+print(p_ceac)
+
+# 5) (Optional) Save a publication-quality TIFF
+# ggsave("CEAC.tiff", p_ceac, width = 7, height = 5, dpi = 600, compression = "lzw")
+
+## --- Two-arm CEAC (Lu-PSMA vs Cabazitaxel) from PSA draws ---
+
+stopifnot(all(c("cost_Lu","qaly_Lu","cost_Cab","qaly_Cab") %in% names(psa_df)))
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tidyr)
+
+# 1) Build CEAC over a WTP grid
+wtp_grid <- seq(0, 300000, by = 1000)
+
+ceac_df <- lapply(wtp_grid, function(wtp){
+  # Net monetary benefit for each sim & each arm
+  nmb_lu  <- wtp * psa_df$qaly_Lu  - psa_df$cost_Lu
+  nmb_cab <- wtp * psa_df$qaly_Cab - psa_df$cost_Cab
+  
+  # Probability each arm is optimal (ties split 50/50)
+  p_lu  <- mean(nmb_lu  >  nmb_cab) + 0.5 * mean(nmb_lu == nmb_cab)
+  p_cab <- 1 - p_lu
+  
+  data.frame(WTP = wtp, Lu_PSMA = p_lu, Cabazitaxel = p_cab)
+}) %>% bind_rows()
+
+# Long format for plotting
+ceac_long <- ceac_df %>%
+  pivot_longer(cols = c(Lu_PSMA, Cabazitaxel),
+               names_to = "Strategy", values_to = "Prob_CE")
+
+# 2) Crossover WTP (where Prob(Lu) == 0.5)
+f_diff <- approxfun(ceac_df$WTP, ceac_df$Lu_PSMA - 0.5, rule = 2)
+if (f_diff(min(wtp_grid)) == 0) {
+  wtp_star <- min(wtp_grid)
+} else if (sign(f_diff(min(wtp_grid))) == sign(f_diff(max(wtp_grid)))) {
+  wtp_star <- NA_real_  # never crosses 50% on the grid
+} else {
+  wtp_star <- uniroot(function(w) f_diff(w), interval = range(wtp_grid))$root
+}
+
+cat("CEAC crossover (≈50/50) at:",
+    ifelse(is.na(wtp_star), "not reached on grid",
+           dollar(round(wtp_star, 0))), "\n")
+
+# 3) Report CE probabilities at common WTP thresholds
+wtp_points <- c(50000, 100000, 200000)
+peek <- lapply(wtp_points, function(w){
+  row <- ceac_df[which.min(abs(ceac_df$WTP - w)), ]
+  data.frame(
+    WTP = w,
+    Prob_CE_Lu  = row$Lu_PSMA,
+    Prob_CE_Cab = row$Cabazitaxel
+  )
+}) %>% bind_rows() %>%
+  mutate(WTP_label = dollar(WTP),
+         Lu_label  = percent(Prob_CE_Lu,  accuracy = 0.1),
+         Cab_label = percent(Prob_CE_Cab, accuracy = 0.1))
+
+print(peek[, c("WTP_label","Lu_label","Cab_label")], row.names = FALSE)
+
+# 4) Plot two-arm CEAC
+p_ceac <- ggplot(ceac_long, aes(x = WTP, y = Prob_CE, color = Strategy)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "gray40") +
+  { if (!is.na(wtp_star)) geom_vline(xintercept = wtp_star, linetype = "dashed",
+                                     color = "gray40") } +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0,1)) +
+  scale_color_manual(values = c("Lu_PSMA" = "#1f78b4", "Cabazitaxel" = "#b2df8a"),
+                     labels = c("Lu-PSMA", "Cabazitaxel"), name = NULL) +
+  labs(x = "Willingness-to-pay (USD per QALY)",
+       y = "Probability cost-effective",
+       title = "Cost-Effectiveness Acceptability Curves (CEAC)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p_ceac)
+
+# 5) (Optional) Save publication-quality TIFF
+# ggsave("CEAC_two_arm.tiff", p_ceac, width = 7, height = 5, dpi = 600, compression = "lzw")
