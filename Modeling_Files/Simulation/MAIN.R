@@ -19,7 +19,8 @@ options(mced.verbose = TRUE)
 # 0) Source function files 
 # ---------------------------------------------------------------------
 source(here("Modeling_Files", "Simulation", "01. data_read.R"))            
-source(here("Modeling_Files", "Simulation", "02. load_fitted_data.R"))     
+source(here("Modeling_Files", "Simulation", "02. load_fitted_data.R"))
+source(here("Modeling_Files", "Simulation", "03. mced_eligibility.R"))   
 source(here("Modeling_Files", "Simulation", "04. stage_shift.R"))         
 source(here("Modeling_Files", "Simulation", "05. single_cancer_screening.R"))
 source(here("Modeling_Files", "Simulation", "06. multi_cancer_screening.R"))
