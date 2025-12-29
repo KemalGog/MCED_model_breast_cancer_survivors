@@ -17,11 +17,11 @@ Because fitted SEER outputs are **not** included in this repository, users shoul
 
 ## 1. Download and Place Required Data Into the `Data/` Folder
 
-This repository does **not** include SEER or Life Table data.
+This repository does **not** include cancer incidence and all-cause mortality data used in the analyses.
 
 Users should download the following from official public sources:
 
--   SEER Incidence 2011-2015 (AJCC 6th Edition)
+-   SEER Incidence 2011-2015 
 -   U.S. Life Tables (2018)
 
 See `Data/README.md` for descriptions of required files.
