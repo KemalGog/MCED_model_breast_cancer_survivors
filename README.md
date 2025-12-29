@@ -19,7 +19,7 @@ Because fitted SEER outputs are **not** included in this repository, users shoul
 
 This repository does **not** include cancer incidence and all-cause mortality data used in the analyses.
 
-Users should download the following from official public sources:
+Users should download the incidence and mortality data from official public sources:
 
 -   SEER Incidence 2011-2015 
 -   U.S. Life Tables (2018)
