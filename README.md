@@ -2,11 +2,11 @@
 
 This repository contains code supporting the analysis described in:
 
-"Is Multi-Cancer Early Detection Likely to be More Beneficial in a Survivor Population? A Modeling Study in Breast Cancer Survivors" (Gogebakan et al.)
+"Multi-Cancer Screening Among Breast Cancer Survivors: A Modeling Study" (Gogebakan et al.)
 
 ## How to Run the Model
 
-This project is organized into two stages:
+This project consists of two steps:
 
 1.  **Calibration of the natural history model** (required before simulation)
 2.  **Simulation of multi-cancer early detection (MCED) screening**
