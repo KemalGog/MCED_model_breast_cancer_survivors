@@ -48,7 +48,7 @@ This script will:
 
 -   read the SEER datasets from `Data/`
 -   apply SIR multipliers for breast cancer survivors
--   fit the natural history model for 16 cancers × (HR+, HR--, average-risk)
+-   calibrate the natural history model for 16 cancers for hormone-receptor positive, hormone-receptor negative, average-risk women
 -   save fitted objects into:
 
 ```         
@@ -59,13 +59,13 @@ Modeling_Files/Fitting/Fitted_SEER_Data/
 
 ## 3. Run simulation model
 
-Once model fitting is complete:
+Once model calibration is complete, run:
 
 ``` r
 source("Modeling_Files/Simulation/MAIN.R")
 ```
 
-The master script:
+The MAIN script:
 
 1.  loads fitted natural history model outputs
 2.  generates MCED screening entry age distribution
