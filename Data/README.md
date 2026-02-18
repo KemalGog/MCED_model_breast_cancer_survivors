@@ -8,7 +8,7 @@ All data correspond to aggregate, publicly available sources from SEER and U.S. 
 #### BC_Incidence_nonmet_HR_2011_2015.xlsx
 
 -   *Source: SEER Incidence 2011-2015*\
-    Age-specific incidence of non-metastatic breast cancer (AJCC 6th Edition stage I-III), stratified by hormone-receptor status.
+    Age-specific incidence of non-metastatic breast cancer (AJCC 7th Edition stage I-III), stratified by hormone-receptor status.
 
 #### AllCancers_Incidence_2011_2015.xlsx
 
@@ -24,7 +24,7 @@ All data correspond to aggregate, publicly available sources from SEER and U.S. 
 
 -   *Source: SEER Incidence 2011-2015*\
     Age- and stage-specific incidence for the 16 cancers included in the MCED screening.\
-    Early stage: AJCC6 I-II; Late stage: AJCC6 III-IV.
+    Early stage: AJCC7 I-II; Late stage: AJCC7 III-IV.
 
 ------------------------------------------------------------------------
 
