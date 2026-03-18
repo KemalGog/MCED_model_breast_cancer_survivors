@@ -2,7 +2,7 @@
 
 This repository contains code supporting the analysis described in:
 
-"Multi-Cancer Screening Among Breast Cancer Survivors: A Modeling Study" (Gogebakan et al.)
+"The Impact of Multi-Cancer Screening on Late-Stage at Diagnosis in Breast Cancer Survivors: A Modeling Study" (Gogebakan et al.)
 
 ## How to Run the Model
 
